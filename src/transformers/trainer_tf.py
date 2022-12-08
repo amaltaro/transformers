@@ -267,7 +267,9 @@ class TFTrainer:
 
         logger.info('Automatic Weights & Biases logging enabled, to disable set os.environ["WANDB_DISABLED"] = "true"')
         combined_dict = {**self.model.config.to_dict(), **self.args.to_sanitized_dict()}
-        wandb.init(project=os.getenv("WANDB_PROJECT", "huggingface"), config=combined_dict, name=self.args.run_name)
+        wandb.init(project=os.getenv("WANDB_PROJECT", "huggingface"),
+                   config=combined_dict,
+                   name=os.getenv("WANDB_NAME", self.args.run_name))
 
     def setup_comet(self):
         """

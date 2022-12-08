@@ -2667,6 +2667,7 @@ class Trainer:
         if self.args.push_to_hub and not _internal_call:
             self.push_to_hub(commit_message="Model save")
 
+    # Alan: disable something in this code to stop checkpoint
     def _save_tpu(self, output_dir: Optional[str] = None):
         output_dir = output_dir if output_dir is not None else self.args.output_dir
         logger.info(f"Saving model checkpoint to {output_dir}")
@@ -2695,6 +2696,7 @@ class Trainer:
         if self.tokenizer is not None and self.args.should_save:
             self.tokenizer.save_pretrained(output_dir)
 
+    # Alan: disable something in this code to stop checkpoint
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
         # If we are executing this function, we are the process zero, so we don't check for that.
         output_dir = output_dir if output_dir is not None else self.args.output_dir
