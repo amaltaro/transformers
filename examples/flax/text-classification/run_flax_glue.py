@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Tuple
 
+import wandb
 import datasets
 import numpy as np
 from datasets import load_dataset
@@ -53,6 +54,12 @@ from transformers.utils import check_min_version, get_full_repo_name, send_examp
 
 
 logger = logging.getLogger(__name__)
+# Make one log on every process with the configuration for debugging.
+logging.basicConfig(
+    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+    datefmt="%m/%d/%Y %H:%M:%S",
+    level=logging.INFO,
+)
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
 check_min_version("4.26.0.dev0")
 
@@ -315,6 +322,7 @@ def glue_eval_data_collator(dataset: Dataset, batch_size: int):
 
 
 def main():
+    total_runtime = time.time()
     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))
     if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
         # If we pass only one argument to the script and it's the path to a json file,
@@ -323,16 +331,13 @@ def main():
     else:
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
+    wandb.init(config=training_args)
+
     # Sending telemetry. Tracking the example usage helps us better allocate resources to maintain them. The
     # information sent is the one passed as arguments along with your Python/PyTorch versions.
     send_example_telemetry("run_glue", model_args, data_args, framework="flax")
 
-    # Make one log on every process with the configuration for debugging.
-    logging.basicConfig(
-        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-        datefmt="%m/%d/%Y %H:%M:%S",
-        level=logging.INFO,
-    )
+
     # Setup logging, we only want one process per machine to log things on the screen.
     logger.setLevel(logging.INFO if jax.process_index() == 0 else logging.ERROR)
     if jax.process_index() == 0:
@@ -511,8 +516,8 @@ def main():
 
     def write_train_metric(summary_writer, train_metrics, train_time, step):
         summary_writer.scalar("train_time", train_time, step)
-
         train_metrics = get_metrics(train_metrics)
+        logger.info("AMR new train_metrics: %s", train_metrics)
         for key, vals in train_metrics.items():
             tag = f"train_{key}"
             for i, val in enumerate(vals):
@@ -576,14 +581,21 @@ def main():
         metric = evaluate.load("accuracy")
 
     logger.info(f"===== Starting training ({num_epochs} epochs) =====")
+    logger.info(f"===== With dataset size {len(train_dataset)} =====")
+    logger.info(f"===== With batch size {train_batch_size} =====")
     train_time = 0
 
     # make sure weights are replicated on each device
     state = replicate(state)
 
     steps_per_epoch = len(train_dataset) // train_batch_size
+    logger.info(f"===== With steps per epoch {steps_per_epoch} =====")
+
     total_steps = steps_per_epoch * num_epochs
     epochs = tqdm(range(num_epochs), desc=f"Epoch ... (0/{num_epochs})", position=0)
+    train_runtime = 0
+    eval_runtime = 0
+    epoch_start = time.time()
     for epoch in epochs:
 
         train_start = time.time()
@@ -594,14 +606,8 @@ def main():
 
         # train
         train_loader = glue_train_data_collator(input_rng, train_dataset, train_batch_size)
-        for step, batch in enumerate(
-            tqdm(
-                train_loader,
-                total=steps_per_epoch,
-                desc="Training...",
-                position=1,
-            ),
-        ):
+        for step, batch in enumerate(tqdm(train_loader, total=steps_per_epoch, desc="Training...", position=1)):
+            t_start = time.time()
             state, train_metric, dropout_rngs = p_train_step(state, batch, dropout_rngs)
             train_metrics.append(train_metric)
 
@@ -621,20 +627,17 @@ def main():
 
                 train_metrics = []
 
-            if (cur_step % training_args.eval_steps == 0 or cur_step % steps_per_epoch == 0) and cur_step > 0:
+            # save training time
+            t_time = time.time() - t_start
+            train_runtime += t_time
 
+            e_start = time.time()
+            if (cur_step % training_args.eval_steps == 0 or cur_step % steps_per_epoch == 0) and cur_step > 0:
                 # evaluate
                 eval_loader = glue_eval_data_collator(eval_dataset, eval_batch_size)
-                for batch in tqdm(
-                    eval_loader,
-                    total=math.ceil(len(eval_dataset) / eval_batch_size),
-                    desc="Evaluating ...",
-                    position=2,
-                ):
+                for batch in tqdm(eval_loader, total=math.ceil(len(eval_dataset) / eval_batch_size), desc="Evaluating ...", position=1):
                     labels = batch.pop("labels")
-                    predictions = pad_shard_unpad(p_eval_step)(
-                        state, batch, min_device_batch=per_device_eval_batch_size
-                    )
+                    predictions = pad_shard_unpad(p_eval_step)(state, batch, min_device_batch=per_device_eval_batch_size)
                     metric.add_batch(predictions=np.array(predictions), references=labels)
 
                 eval_metric = metric.compute()
@@ -643,6 +646,10 @@ def main():
 
                 if has_tensorboard and jax.process_index() == 0:
                     write_eval_metric(summary_writer, eval_metric, cur_step)
+
+            # save eval time
+            e_time = time.time() - e_start
+            eval_runtime += e_time
 
             if (cur_step % training_args.save_steps == 0 and cur_step > 0) or (cur_step == total_steps):
                 # save checkpoint after each epoch and push checkpoint to the hub
@@ -654,12 +661,26 @@ def main():
                         repo.push_to_hub(commit_message=f"Saving weights and logs of step {cur_step}", blocking=False)
             epochs.desc = f"Epoch ... {epoch + 1}/{num_epochs}"
 
+        logger.info("AMR training time: %s up to epoch number: %s, at: %s", train_runtime, epoch, time.time())
+        logger.info("AMR evaluate time: %s up to epoch number: %s, at: %s", eval_runtime, epoch, time.time())
+
+    # saves total epoch time
+    epoch_runtime = time.time() - epoch_start
+
     # save the eval metrics in json
     if jax.process_index() == 0:
         eval_metric = {f"eval_{metric_name}": value for metric_name, value in eval_metric.items()}
         path = os.path.join(training_args.output_dir, "eval_results.json")
         with open(path, "w") as f:
             json.dump(eval_metric, f, indent=4, sort_keys=True)
+
+    total_runtime = time.time() - total_runtime
+    wandb_data = {"train/train_runtime": train_runtime,
+                  "eval/runtime": eval_runtime,
+                  "epoch_runtime": epoch_runtime,
+                  "total_runtime": total_runtime}
+    wandb.log(wandb_data)
+    logger.info("AMR summary: %s", wandb_data)
 
 
 if __name__ == "__main__":
